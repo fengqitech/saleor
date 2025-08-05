@@ -52,11 +52,11 @@ RUN SECRET_KEY=dummy STATIC_URL=${STATIC_URL} python3 manage.py collectstatic --
 EXPOSE 8000
 ENV PYTHONUNBUFFERED=1
 
-LABEL org.opencontainers.image.title="saleor/saleor" \
+LABEL org.opencontainers.image.title="fengqi/saleor" \
   org.opencontainers.image.description="The commerce engine for modern software development teams." \
-  org.opencontainers.image.url="https://saleor.io/" \
-  org.opencontainers.image.source="https://github.com/saleor/saleor" \
-  org.opencontainers.image.authors="Saleor Commerce (https://saleor.io)" \
+  org.opencontainers.image.url="https://fengqi.tech/" \
+  org.opencontainers.image.source="https://github.com/fengqitech/saleor" \
+  org.opencontainers.image.authors="Saleor Commerce (https://saleor.io) & Fengqi Tech (https://fengqi.tech)" \
   org.opencontainers.image.licenses="BSD-3-Clause"
 
 CMD ["uvicorn", "saleor.asgi:application", "--host=0.0.0.0", "--port=8000", "--workers=2", "--lifespan=off", "--ws=none", "--no-server-header", "--no-access-log", "--timeout-keep-alive=35", "--timeout-graceful-shutdown=30", "--limit-max-requests=10000"]
