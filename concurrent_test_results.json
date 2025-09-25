@@ -1,0 +1,35 @@
+[
+  {
+    "tenant_code": "stahzgsz",
+    "total_queries": 439,
+    "success_count": 439,
+    "error_count": 0,
+    "success_rate": 100.0,
+    "avg_response_time": 0.06598405142851463,
+    "min_response_time": 0.03335905075073242,
+    "max_response_time": 0.1334538459777832,
+    "p95_response_time": 0.1089024543762207
+  },
+  {
+    "tenant_code": "ws3cc4nn",
+    "total_queries": 425,
+    "success_count": 425,
+    "error_count": 0,
+    "success_rate": 100.0,
+    "avg_response_time": 0.06856234213885139,
+    "min_response_time": 0.033124446868896484,
+    "max_response_time": 0.17695951461791992,
+    "p95_response_time": 0.1104285717010498
+  },
+  {
+    "tenant_code": "abc23456",
+    "total_queries": 445,
+    "success_count": 445,
+    "error_count": 0,
+    "success_rate": 100.0,
+    "avg_response_time": 0.06511210913068793,
+    "min_response_time": 0.03461909294128418,
+    "max_response_time": 0.13412165641784668,
+    "p95_response_time": 0.10993599891662598
+  }
+]
