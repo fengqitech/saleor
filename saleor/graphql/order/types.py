@@ -10,7 +10,6 @@ from promise import Promise
 
 from ...account.models import Address
 from ...account.models import User as UserModel
-from ...checkout.utils import get_external_shipping_id
 from ...core.anonymize import obfuscate_address, obfuscate_email
 from ...core.db.connection import allow_writer_in_context
 from ...core.prices import quantize_price
@@ -23,7 +22,9 @@ from ...graphql.core.context import (
     get_database_connection_name,
 )
 from ...graphql.core.federation.entities import federated_entity
-from ...graphql.core.federation.resolvers import resolve_federation_references
+from ...graphql.core.federation.resolvers import (
+    resolve_federation_references,
+)
 from ...graphql.order.resolvers import resolve_orders
 from ...graphql.utils import get_user_or_app_from_context
 from ...graphql.warehouse.dataloaders import StockByIdLoader, WarehouseByIdLoader
@@ -31,6 +32,7 @@ from ...order import OrderOrigin, OrderStatus, calculations, models
 from ...order.calculations import fetch_order_prices_if_expired
 from ...order.models import FulfillmentStatus
 from ...order.utils import (
+    get_external_shipping_id,
     get_order_country,
     get_valid_collection_points_for_order,
     get_valid_shipping_methods_for_order,
@@ -42,6 +44,7 @@ from ...permission.auth_filters import AuthorizationFilters, is_app, is_staff_us
 from ...permission.enums import (
     AccountPermissions,
     AppPermission,
+    CheckoutPermissions,
     OrderPermissions,
     PaymentPermissions,
     ProductPermissions,
@@ -64,7 +67,8 @@ from ..account.utils import (
 )
 from ..app.dataloaders import AppByIdLoader
 from ..app.types import App
-from ..channel.dataloaders import ChannelByIdLoader, ChannelByOrderIdLoader
+from ..channel.dataloaders.by_order import ChannelByOrderIdLoader
+from ..channel.dataloaders.by_self import ChannelByIdLoader
 from ..channel.types import Channel
 from ..checkout.utils import prevent_sync_event_circular_query
 from ..core.connection import CountableConnection
@@ -74,6 +78,7 @@ from ..core.descriptions import (
     ADDED_IN_319,
     ADDED_IN_320,
     ADDED_IN_321,
+    ADDED_IN_322,
     DEPRECATED_IN_3X_INPUT,
     PREVIEW_FEATURE,
 )
@@ -110,6 +115,8 @@ from ..invoice.dataloaders import InvoicesByOrderIdLoader
 from ..invoice.types import Invoice
 from ..meta.resolvers import check_private_metadata_privilege, resolve_metadata
 from ..meta.types import MetadataItem, ObjectWithMetadata
+from ..page.dataloaders import PageByIdLoader
+from ..page.types import Page
 from ..payment.dataloaders import (
     TransactionByPaymentIdLoader,
     TransactionItemByIDLoader,
@@ -267,7 +274,12 @@ class OrderGrantedRefund(
     created_at = DateTime(required=True, description="Time of creation.")
     updated_at = DateTime(required=True, description="Time of last update.")
     amount = graphene.Field(Money, required=True, description="Refund amount.")
-    reason = graphene.String(description="Reason of the refund.")
+    reason = graphene.String(description="Reason of the refund." + ADDED_IN_322)
+    reason_reference = graphene.Field(
+        Page,
+        required=False,
+        description="Reason Model (Page) reference for refund." + ADDED_IN_322,
+    )
     user = graphene.Field(
         User,
         description=(
@@ -385,6 +397,31 @@ class OrderGrantedRefund(
             return None
         return TransactionItemByIDLoader(info.context).load(
             granted_refund.transaction_item_id
+        )
+
+    @staticmethod
+    def resolve_reason_reference(
+        root: SyncWebhookControlContext[models.OrderGrantedRefund], info
+    ):
+        if not root.node.reason_reference:
+            return None
+
+        def wrap_page_with_context(page):
+            if not page:
+                return None
+
+            return (
+                ChannelByOrderIdLoader(info.context)
+                .load(root.node.order_id)
+                .then(
+                    lambda channel: ChannelContext(node=page, channel_slug=channel.slug)
+                )
+            )
+
+        return (
+            PageByIdLoader(info.context)
+            .load(root.node.reason_reference_id)
+            .then(wrap_page_with_context)
         )
 
 
@@ -2012,10 +2049,14 @@ class Order(SyncWebhookControlContextModelObjectType[ModelObjectType[models.Orde
                 user, address = data
 
             requester = get_user_or_app_from_context(info.context)
-            if order.use_old_id is False or is_owner_or_has_one_of_perms(
+
+            if order.use_old_id is False:
+                return address
+            if user and is_owner_or_has_one_of_perms(
                 requester, user, OrderPermissions.MANAGE_ORDERS
             ):
                 return address
+
             return obfuscate_address(address)
 
         if not order.billing_address_id:
@@ -2043,7 +2084,9 @@ class Order(SyncWebhookControlContextModelObjectType[ModelObjectType[models.Orde
             else:
                 user, address = data
             requester = get_user_or_app_from_context(info.context)
-            if order.use_old_id is False or is_owner_or_has_one_of_perms(
+            if order.use_old_id is False:
+                return address
+            if user and is_owner_or_has_one_of_perms(
                 requester, user, OrderPermissions.MANAGE_ORDERS
             ):
                 return address
@@ -2495,10 +2538,13 @@ class Order(SyncWebhookControlContextModelObjectType[ModelObjectType[models.Orde
             elif user:
                 email_to_return = user.email
 
-            if order.use_old_id is False or is_owner_or_has_one_of_perms(
+            if order.use_old_id is False:
+                return email_to_return
+            if user and is_owner_or_has_one_of_perms(
                 requester, user, OrderPermissions.MANAGE_ORDERS
             ):
                 return email_to_return
+
             return obfuscate_email(email_to_return)
 
         if not order.user_id:
@@ -2522,6 +2568,7 @@ class Order(SyncWebhookControlContextModelObjectType[ModelObjectType[models.Orde
                 AccountPermissions.MANAGE_USERS,
                 OrderPermissions.MANAGE_ORDERS,
                 PaymentPermissions.HANDLE_PAYMENTS,
+                CheckoutPermissions.HANDLE_TAXES,
             )
             return user
 
@@ -2547,10 +2594,16 @@ class Order(SyncWebhookControlContextModelObjectType[ModelObjectType[models.Orde
                     if prices_entered_with_tax
                     else order.shipping_price_net
                 )
+                shipping_method_metadata = order.shipping_method_metadata or {}
+                shipping_method_private_metadata = (
+                    order.shipping_method_private_metadata or {}
+                )
                 return ShippingMethodData(
                     id=external_app_shipping_id,
                     name=order.shipping_method_name,
                     price=price,
+                    metadata=shipping_method_metadata,
+                    private_metadata=shipping_method_private_metadata,
                 )
 
             return tax_config.then(with_tax_config)
@@ -2576,9 +2629,27 @@ class Order(SyncWebhookControlContextModelObjectType[ModelObjectType[models.Orde
                 listing, tax_class = data
                 if not listing:
                     return None
-                return convert_to_shipping_method_data(
-                    shipping_method, listing, tax_class
+                shipping_method_data = convert_to_shipping_method_data(
+                    shipping_method,
+                    listing,
+                    tax_class,
                 )
+                if order.status == OrderStatus.DRAFT:
+                    # For draft orders, we always use the metadata stored on the order itself.
+                    return shipping_method_data
+
+                # TODO (ENG-1053): Remove this fallback logic after migration period.
+                # When shipping_method_metadata is None, we fall back to the shipping method's
+                # metadata from the assigned shipping method for backward compatibility reasons.
+                # This ensures that orders created before the metadata was stored directly on
+                # the order will still have access to the shipping method's metadata.
+                if order.shipping_method_metadata is not None:
+                    shipping_method_data.metadata = order.shipping_method_metadata
+                if order.shipping_method_private_metadata is not None:
+                    shipping_method_data.private_metadata = (
+                        order.shipping_method_private_metadata
+                    )
+                return shipping_method_data
 
             return Promise.all([listing, tax_class]).then(calculate_price)
 
@@ -2672,11 +2743,14 @@ class Order(SyncWebhookControlContextModelObjectType[ModelObjectType[models.Orde
     def resolve_invoices(root: SyncWebhookControlContext[models.Order], info):
         order = root.node
         requester = get_user_or_app_from_context(info.context)
-        if order.use_old_id is True:
+        if order.use_old_id is False:
+            return InvoicesByOrderIdLoader(info.context).load(order.id)
+        if order.user_id:
             check_is_owner_or_has_one_of_perms(
                 requester, order.user, OrderPermissions.MANAGE_ORDERS
             )
-        return InvoicesByOrderIdLoader(info.context).load(order.id)
+            return InvoicesByOrderIdLoader(info.context).load(order.id)
+        return []
 
     @staticmethod
     def resolve_is_shipping_required(

@@ -8,7 +8,6 @@ from django.db import transaction
 from django.utils import timezone
 from prices import Money, TaxedMoney
 
-from ..checkout import CheckoutAuthorizeStatus, base_calculations
 from ..core.db.connection import allow_writer
 from ..core.prices import quantize_price
 from ..core.taxes import (
@@ -31,7 +30,9 @@ from ..tax.utils import (
     get_tax_calculation_strategy_for_checkout,
     normalize_tax_rate_for_db,
 )
+from . import CheckoutAuthorizeStatus, base_calculations
 from .fetch import find_checkout_line_info
+from .lock_objects import checkout_qs_select_for_update
 from .models import Checkout
 from .payment_utils import update_checkout_payment_statuses
 
@@ -64,7 +65,6 @@ def checkout_shipping_price(
         checkout_info,
         manager=manager,
         lines=lines,
-        address=address,
         database_connection_name=database_connection_name,
         pregenerated_subscription_payloads=pregenerated_subscription_payloads,
         allow_sync_webhooks=allow_sync_webhooks,
@@ -89,7 +89,6 @@ def checkout_shipping_tax_rate(
         checkout_info,
         manager=manager,
         lines=lines,
-        address=address,
         database_connection_name=database_connection_name,
         allow_sync_webhooks=allow_sync_webhooks,
     )
@@ -117,7 +116,6 @@ def checkout_subtotal(
         checkout_info,
         manager=manager,
         lines=lines,
-        address=address,
         database_connection_name=database_connection_name,
         pregenerated_subscription_payloads=pregenerated_subscription_payloads,
         allow_sync_webhooks=allow_sync_webhooks,
@@ -198,7 +196,6 @@ def calculate_checkout_total(
         checkout_info,
         manager=manager,
         lines=lines,
-        address=address,
         database_connection_name=database_connection_name,
         pregenerated_subscription_payloads=pregenerated_subscription_payloads,
         force_update=force_update,
@@ -224,12 +221,10 @@ def checkout_line_total(
     if pregenerated_subscription_payloads is None:
         pregenerated_subscription_payloads = {}
     currency = checkout_info.checkout.currency
-    address = checkout_info.shipping_address or checkout_info.billing_address
     _, lines = fetch_checkout_data(
         checkout_info,
         manager=manager,
         lines=lines,
-        address=address,
         database_connection_name=database_connection_name,
         pregenerated_subscription_payloads=pregenerated_subscription_payloads,
         allow_sync_webhooks=allow_sync_webhooks,
@@ -255,12 +250,10 @@ def checkout_line_unit_price(
     if pregenerated_subscription_payloads is None:
         pregenerated_subscription_payloads = {}
     currency = checkout_info.checkout.currency
-    address = checkout_info.shipping_address or checkout_info.billing_address
     _, lines = fetch_checkout_data(
         checkout_info,
         manager=manager,
         lines=lines,
-        address=address,
         database_connection_name=database_connection_name,
         pregenerated_subscription_payloads=pregenerated_subscription_payloads,
         allow_sync_webhooks=allow_sync_webhooks,
@@ -283,12 +276,10 @@ def checkout_line_tax_rate(
 
     It takes in account all plugins.
     """
-    address = checkout_info.shipping_address or checkout_info.billing_address
     _, lines = fetch_checkout_data(
         checkout_info,
         manager=manager,
         lines=lines,
-        address=address,
         database_connection_name=database_connection_name,
         allow_sync_webhooks=allow_sync_webhooks,
     )
@@ -357,7 +348,6 @@ def _fetch_checkout_prices_if_expired(
     manager: "PluginsManager",
     lines: list["CheckoutLineInfo"],
     allow_sync_webhooks: bool,
-    address: Optional["Address"] = None,
     force_update: bool = False,
     database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
     pregenerated_subscription_payloads: dict | None = None,
@@ -400,13 +390,16 @@ def _fetch_checkout_prices_if_expired(
         checkout_info, database_connection_name
     )
 
-    lines = cast(list, lines)
-    update_undiscounted_unit_price_for_lines(lines)
-    update_prior_unit_price_for_lines(lines)
-
-    create_or_update_discount_objects_from_promotion_for_checkout(
-        checkout_info, lines, database_connection_name
-    )
+    try:
+        recalculate_discounts(
+            checkout_info,
+            lines,
+            database_connection_name=database_connection_name,
+            force_update=force_update,
+        )
+    except Checkout.DoesNotExist:
+        # Checkout was removed or converted to a order. Return data without saving.
+        return checkout_info, lines
 
     checkout.tax_error = None
 
@@ -424,7 +417,6 @@ def _fetch_checkout_prices_if_expired(
                 checkout_info,
                 lines,
                 prices_entered_with_tax,
-                address,
                 database_connection_name=database_connection_name,
                 pregenerated_subscription_payloads=pregenerated_subscription_payloads,
             )
@@ -442,45 +434,109 @@ def _fetch_checkout_prices_if_expired(
             # tax from the original gross prices.
             _remove_tax(checkout, lines)
 
-    checkout_update_fields = [
-        "voucher_code",
-        "total_net_amount",
-        "total_gross_amount",
-        "subtotal_net_amount",
-        "subtotal_gross_amount",
-        "shipping_price_net_amount",
-        "shipping_price_gross_amount",
-        "undiscounted_base_shipping_price_amount",
-        "shipping_tax_rate",
-        "translated_discount_name",
-        "discount_amount",
-        "discount_name",
-        "currency",
-        "last_change",
-        "price_expiration",
-        "tax_error",
-    ]
-
-    checkout.price_expiration = timezone.now() + settings.CHECKOUT_PRICES_TTL
-
-    from .utils import checkout_lines_bulk_update
+    price_expiration = timezone.now() + settings.CHECKOUT_PRICES_TTL
+    checkout.price_expiration = price_expiration
+    checkout.discount_expiration = price_expiration
 
     with allow_writer():
         with transaction.atomic():
-            checkout.save(
-                update_fields=checkout_update_fields,
-                using=settings.DATABASE_CONNECTION_DEFAULT_NAME,
-            )
-            checkout_lines_bulk_update(
-                [line_info.line for line_info in lines],
-                [
-                    "total_price_net_amount",
-                    "total_price_gross_amount",
-                    "tax_rate",
-                    "undiscounted_unit_price_amount",
-                    "prior_unit_price_amount",
-                ],
-            )
+            try:
+                locked_checkout = (
+                    checkout_qs_select_for_update()
+                    .only("last_change")
+                    .get(token=checkout.token)
+                )
+            except Checkout.DoesNotExist:
+                # Checkout was removed or converted to a order. Return data without saving.
+                return checkout_info, lines
+
+            # Check whether the checkout has been modified during the recalculation process by another process.
+            # If so, we should skip saving. The same applies if the checkout has been removed. This is important
+            # to avoid overwriting changes made by the other requests. Skipping the save function does not affect
+            # the query response because it returns the adjusted checkout and line info objects.
+            if checkout.last_change == locked_checkout.last_change:
+                checkout_update_fields = [
+                    "voucher_code",
+                    "total_net_amount",
+                    "total_gross_amount",
+                    "subtotal_net_amount",
+                    "subtotal_gross_amount",
+                    "shipping_price_net_amount",
+                    "shipping_price_gross_amount",
+                    "undiscounted_base_shipping_price_amount",
+                    "shipping_tax_rate",
+                    "translated_discount_name",
+                    "discount_amount",
+                    "discount_name",
+                    "currency",
+                    "price_expiration",
+                    "discount_expiration",
+                    "tax_error",
+                ]
+
+                from .utils import checkout_lines_bulk_update
+
+                checkout.save(
+                    update_fields=checkout_update_fields,
+                    using=settings.DATABASE_CONNECTION_DEFAULT_NAME,
+                )
+                checkout_lines_bulk_update(
+                    [line_info.line for line_info in lines],
+                    [
+                        "total_price_net_amount",
+                        "total_price_gross_amount",
+                        "tax_rate",
+                        "undiscounted_unit_price_amount",
+                        "prior_unit_price_amount",
+                    ],
+                )
+    return checkout_info, lines
+
+
+@allow_writer()
+def recalculate_discounts(
+    checkout_info: "CheckoutInfo",
+    lines_info: Iterable["CheckoutLineInfo"],
+    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
+    force_update: bool = False,
+) -> tuple["CheckoutInfo", Iterable["CheckoutLineInfo"]]:
+    """Recalculate checkout discounts.
+
+    Discounts are recalculated only if force_update is True, or if both discount
+    and price expirations have passed.
+    This updates catalogue promotions, vouchers, and order promotion discounts.
+    """
+    checkout = checkout_info.checkout
+
+    # Do not recalculate discounts in case the checkout prices are still valid, either
+    # discounts or tax prices.
+    if not force_update and (
+        checkout.discount_expiration > timezone.now()
+        or checkout.price_expiration > timezone.now()
+    ):
+        return checkout_info, lines_info
+
+    lines = cast(list, lines_info)
+    update_undiscounted_unit_price_for_lines(lines)
+    update_prior_unit_price_for_lines(lines)
+
+    soonest_promotion_end_date = (
+        create_or_update_discount_objects_from_promotion_for_checkout(
+            checkout_info, lines, database_connection_name
+        )
+    )
+
+    if soonest_promotion_end_date is not None:
+        checkout.discount_expiration = min(
+            soonest_promotion_end_date, timezone.now() + settings.CHECKOUT_PRICES_TTL
+        )
+    else:
+        checkout.discount_expiration = timezone.now() + settings.CHECKOUT_PRICES_TTL
+
+    checkout.safe_update(
+        update_fields=["discount_expiration"],
+    )
+
     return checkout_info, lines
 
 
@@ -492,7 +548,6 @@ def _calculate_and_add_tax(
     checkout_info: "CheckoutInfo",
     lines: list["CheckoutLineInfo"],
     prices_entered_with_tax: bool,
-    address: Optional["Address"] = None,
     database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
     pregenerated_subscription_payloads: dict | None = None,
 ):
@@ -506,7 +561,6 @@ def _calculate_and_add_tax(
             checkout_info,
             lines,
             prices_entered_with_tax,
-            address,
             database_connection_name=database_connection_name,
         )
         return
@@ -516,7 +570,7 @@ def _calculate_and_add_tax(
     # configured with Avatax plugin identifier.
     if not tax_app_identifier:
         # Call the tax plugins.
-        _apply_tax_data_from_plugins(checkout, manager, checkout_info, lines, address)
+        _apply_tax_data_from_plugins(checkout, manager, checkout_info, lines)
         # Get the taxes calculated with apps and apply to checkout.
         # We should allow empty tax_data in case any tax webhook has not been
         # configured - handled by `allowed_empty_tax_data`
@@ -536,7 +590,6 @@ def _calculate_and_add_tax(
             manager,
             checkout_info,
             lines,
-            address,
             pregenerated_subscription_payloads,
         )
 
@@ -547,7 +600,6 @@ def _call_plugin_or_tax_app(
     manager: "PluginsManager",
     checkout_info: "CheckoutInfo",
     lines: list["CheckoutLineInfo"],
-    address: Optional["Address"] = None,
     pregenerated_subscription_payloads: dict | None = None,
 ):
     if pregenerated_subscription_payloads is None:
@@ -567,7 +619,6 @@ def _call_plugin_or_tax_app(
             manager,
             checkout_info,
             lines,
-            address,
             plugin_ids=plugin_ids,
         )
         if checkout.tax_error:
@@ -598,6 +649,8 @@ def _get_taxes_for_checkout(
     """
     from .utils import log_address_if_validation_skipped_for_checkout
 
+    if pregenerated_subscription_payloads is None:
+        pregenerated_subscription_payloads = {}
     tax_data = None
     try:
         tax_data = manager.get_taxes_for_checkout(
@@ -686,9 +739,9 @@ def _apply_tax_data_from_plugins(
     manager: "PluginsManager",
     checkout_info: "CheckoutInfo",
     lines: list["CheckoutLineInfo"],
-    address: Optional["Address"],
     plugin_ids: list[str] | None = None,
 ) -> None:
+    address = checkout_info.shipping_address or checkout_info.billing_address
     for line_info in lines:
         line = line_info.line
 
@@ -771,7 +824,6 @@ def fetch_checkout_data(
     checkout_info: "CheckoutInfo",
     manager: "PluginsManager",
     lines: list["CheckoutLineInfo"],
-    address: Optional["Address"] = None,
     force_update: bool = False,
     checkout_transactions: Iterable["TransactionItem"] | None = None,
     force_status_update: bool = False,
@@ -786,12 +838,11 @@ def fetch_checkout_data(
     """
     if pregenerated_subscription_payloads is None:
         pregenerated_subscription_payloads = {}
-    previous_total_gross = checkout_info.checkout.total.gross
+    previous_checkout_price_expiration = checkout_info.checkout.price_expiration
     checkout_info, lines = _fetch_checkout_prices_if_expired(
         checkout_info=checkout_info,
         manager=manager,
         lines=lines,
-        address=address,
         force_update=force_update,
         database_connection_name=database_connection_name,
         pregenerated_subscription_payloads=pregenerated_subscription_payloads,
@@ -799,7 +850,7 @@ def fetch_checkout_data(
     )
     current_total_gross = checkout_info.checkout.total.gross
     if (
-        current_total_gross != previous_total_gross
+        checkout_info.checkout.price_expiration != previous_checkout_price_expiration
         or force_status_update
         or (
             # Checkout with total being zero is fully authorized therefore
@@ -809,6 +860,15 @@ def fetch_checkout_data(
             and bool(lines)
         )
     ):
+        current_total_gross = (
+            checkout_info.checkout.total.gross
+            - checkout_info.checkout.get_total_gift_cards_balance(
+                database_connection_name
+            )
+        )
+        current_total_gross = max(
+            current_total_gross, zero_money(current_total_gross.currency)
+        )
         update_checkout_payment_statuses(
             checkout=checkout_info.checkout,
             checkout_total_gross=current_total_gross,

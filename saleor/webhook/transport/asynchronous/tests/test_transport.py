@@ -60,6 +60,9 @@ def test_send_webhook_request_async_record_external_request(
     # then
     attributes = {
         "server.address": "www.example.com",
+        "saleor.app.identifier": event_delivery.webhook.app.identifier,
+        "saleor.webhook.event_type": event_delivery.event_type,
+        "saleor.webhook.execution_mode": "async",
         **global_attributes,
     }
     metrics_data = get_test_metrics_data()
@@ -109,6 +112,9 @@ def test_send_webhook_request_async_record_external_request_when_delivery_attemp
     attributes = {
         "server.address": "www.example.com",
         "error.type": "request_error",
+        "saleor.app.identifier": event_delivery.webhook.app.identifier,
+        "saleor.webhook.event_type": event_delivery.event_type,
+        "saleor.webhook.execution_mode": "async",
         **global_attributes,
     }
     metrics_data = get_test_metrics_data()
@@ -157,6 +163,9 @@ def test_send_webhook_request_async_record_external_request_with_unknown_webhook
     attributes = {
         "server.address": "www.example.com",
         "error.type": "request_error",
+        "saleor.app.identifier": event_delivery.webhook.app.identifier,
+        "saleor.webhook.event_type": event_delivery.event_type,
+        "saleor.webhook.execution_mode": "async",
         **global_attributes,
     }
     metrics_data = get_test_metrics_data()
@@ -178,3 +187,18 @@ def test_send_webhook_request_async_record_external_request_with_unknown_webhook
     assert external_request_content_length.attributes == attributes
     assert external_request_content_length.count == 1
     assert external_request_content_length.sum == payload_size
+
+
+@patch("saleor.webhook.transport.asynchronous.transport.webhooks_otel_trace")
+def test_send_webhook_request_async_fails_when_exception_raised_by_webhooks_otel_trace(
+    mock_webhooks_otel_trace,
+    event_delivery,
+):
+    # given
+    mock_webhooks_otel_trace.side_effect = ValueError("OTel error")
+
+    # when & then
+    with pytest.raises(ValueError, match="OTel error"):
+        send_webhook_request_async(
+            event_delivery_id=event_delivery.id, telemetry_context={}
+        )

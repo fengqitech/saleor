@@ -8,9 +8,16 @@ from ...channel import MarkAsPaidStrategy
 from ...core.models import EventDelivery
 from ...core.utils.events import call_event_including_protected_events
 from ...giftcard import GiftCardEvents
+from ...giftcard.const import GIFT_CARD_PAYMENT_GATEWAY_ID
 from ...giftcard.models import GiftCard, GiftCardEvent
 from ...order.fetch import OrderLineInfo, fetch_order_info
-from ...payment import ChargeStatus, PaymentError, TransactionEventType, TransactionKind
+from ...payment import (
+    ChargeStatus,
+    PaymentError,
+    TransactionAction,
+    TransactionEventType,
+    TransactionKind,
+)
 from ...payment.models import Payment
 from ...plugins.manager import get_plugins_manager
 from ...product.models import DigitalContent
@@ -37,7 +44,6 @@ from ..actions import (
     call_order_events,
     cancel_fulfillment,
     cancel_order,
-    cancel_waiting_fulfillment,
     clean_mark_order_as_paid,
     fulfill_order_lines,
     handle_fully_paid_order,
@@ -425,7 +431,7 @@ def test_handle_fully_paid_order_triggers_webhooks(
             call(
                 kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                MessageGroupId="example.com:saleor.app.additional",
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -569,21 +575,33 @@ def test_cancel_fulfillment(fulfilled_order, warehouse):
     assert line_2.order_line.quantity_fulfilled == 0
 
 
-def test_cancel_waiting_fulfillment_for_unconfirmed_order(fulfilled_order):
-    for fulfillment in fulfilled_order.fulfillments.all():
-        fulfillment.status = FulfillmentStatus.WAITING_FOR_APPROVAL
-        fulfillment.save()
-    fulfilled_order.status = OrderStatus.UNCONFIRMED
-    fulfilled_order.save()
+def test_cancel_fulfillment_waiting_for_approval(fulfilled_order):
+    # given
+    fulfillment = fulfilled_order.fulfillments.first()
+    fulfillment.status = FulfillmentStatus.WAITING_FOR_APPROVAL
+    fulfillment.save(update_fields=["status"])
 
-    cancel_waiting_fulfillment(
-        fulfilled_order.fulfillments.first(),
+    fulfilled_order.status = OrderStatus.UNCONFIRMED
+    fulfilled_order.save(update_fields=["status"])
+    warehouse = None
+
+    # when
+    cancel_fulfillment(
+        fulfillment,
         None,
         None,
-        get_plugins_manager(allow_replica=False),
+        warehouse,
+        manager=get_plugins_manager(allow_replica=False),
     )
 
-    assert fulfilled_order.status == OrderStatus.UNCONFIRMED
+    # then
+    fulfillment.refresh_from_db()
+    fulfilled_order.refresh_from_db()
+    line_1, line_2 = fulfillment.lines.all()
+    assert fulfillment.status == FulfillmentStatus.CANCELED
+    assert fulfilled_order.status == OrderStatus.UNFULFILLED
+    assert line_1.order_line.quantity_fulfilled == 0
+    assert line_2.order_line.quantity_fulfilled == 0
 
 
 def test_cancel_fulfillment_variant_without_inventory_tracking(
@@ -713,7 +731,7 @@ def test_cancel_order_dont_trigger_webhooks(
             call(
                 kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                MessageGroupId="example.com:saleor.app.additional",
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -887,7 +905,7 @@ def test_order_refunded_triggers_webhooks(
             call(
                 kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                MessageGroupId="example.com:saleor.app.additional",
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -986,7 +1004,7 @@ def test_order_voided_triggers_webhooks(
             "telemetry_context": ANY,
         },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -1094,7 +1112,7 @@ def test_order_fulfilled_dont_trigger_webhooks(
             call(
                 kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                MessageGroupId="example.com:saleor.app.additional",
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -1179,7 +1197,7 @@ def test_order_awaits_fulfillment_approval_triggers_webhooks(
             "telemetry_context": ANY,
         },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -1273,7 +1291,7 @@ def test_order_authorized_triggers_webhooks(
             "telemetry_context": ANY,
         },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -1389,7 +1407,7 @@ def test_order_charged_triggers_webhooks(
             call(
                 kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                MessageGroupId="example.com:saleor.app.additional",
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -1783,7 +1801,7 @@ def test_order_transaction_updated_for_charged_triggers_webhooks(
             call(
                 kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                MessageGroupId="example.com:saleor.app.additional",
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -1899,7 +1917,7 @@ def test_order_transaction_updated_for_authorized_triggers_webhooks(
             "telemetry_context": ANY,
         },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -2023,7 +2041,7 @@ def test_order_transaction_updated_for_refunded_triggers_webhooks(
             call(
                 kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                MessageGroupId="example.com:saleor.app.additional",
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -2524,7 +2542,7 @@ def test_call_order_event_triggers_sync_webhook(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -2656,7 +2674,7 @@ def test_call_order_event_missing_filter_shipping_method_webhook(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     mocked_send_webhook_request_sync.assert_called_once()
@@ -2737,7 +2755,7 @@ def test_call_order_event_skips_tax_webhook_when_prices_are_valid(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -2825,7 +2843,7 @@ def test_call_order_event_skips_sync_webhooks_when_order_not_editable(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
     assert not mocked_send_webhook_request_sync.called
     assert not EventDelivery.objects.exclude(webhook_id=order_webhook.id).exists()
@@ -2885,7 +2903,7 @@ def test_call_order_event_skips_sync_webhooks_when_draft_order_deleted(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
     assert not mocked_send_webhook_request_sync.called
     mocked_call_event_including_protected_events.assert_called_once_with(
@@ -2983,7 +3001,7 @@ def test_call_order_event_skips_when_sync_webhooks_missing(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.test",
+        MessageGroupId="example.com:saleorapptest",
     )
     assert not mocked_send_webhook_request_sync.called
     mocked_call_event_including_protected_events.assert_called_once_with(
@@ -3055,7 +3073,7 @@ def test_call_order_events_triggers_sync_webhook(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
     # confirm each sync webhook was called without saving event delivery
     assert mocked_send_webhook_request_sync.call_count == 2
@@ -3207,7 +3225,7 @@ def test_call_order_events_missing_filter_shipping_method_webhook(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -3300,7 +3318,7 @@ def test_call_order_events_skips_tax_webhook_when_prices_are_valid(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -3406,7 +3424,7 @@ def test_call_order_events_skips_sync_webhooks_when_order_not_editable(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
     assert not mocked_send_webhook_request_sync.called
     mocked_call_event_including_protected_events.assert_has_calls(
@@ -3477,7 +3495,7 @@ def test_call_order_events_skips_sync_webhooks_when_draft_order_deleted(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
     assert not mocked_send_webhook_request_sync.called
     mocked_call_event_including_protected_events.assert_has_calls(
@@ -3590,7 +3608,7 @@ def test_call_order_events_skips_when_sync_webhooks_missing(
     mocked_send_webhook_request_async.assert_called_once_with(
         kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.test",
+        MessageGroupId="example.com:saleorapptest",
     )
     assert not mocked_send_webhook_request_sync.called
     mocked_call_event_including_protected_events.assert_has_calls(
@@ -3707,7 +3725,7 @@ def test_order_created_triggers_webhooks(
             call(
                 kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                MessageGroupId="example.com:saleor.app.additional",
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -3821,7 +3839,7 @@ def test_order_confirmed_triggers_webhooks(
             "telemetry_context": ANY,
         },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        MessageGroupId="example.com:saleor.app.additional",
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -3846,3 +3864,181 @@ def test_order_confirmed_triggers_webhooks(
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
     assert wrapped_call_order_event.called
+
+
+def test_order_confirmed_charges_funds_authorized_from_gift_card(
+    order_with_lines,
+    django_capture_on_commit_callbacks,
+    customer_user,
+    gift_card_created_by_staff,
+    transaction_item_generator,
+):
+    # given
+    order = order_with_lines
+    manager = get_plugins_manager(False)
+
+    gift_card_created_by_staff.current_balance_amount = Decimal(100)
+    gift_card_created_by_staff.save(update_fields=["current_balance_amount"])
+
+    transaction = transaction_item_generator(
+        app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID,
+        order_id=order.pk,
+        gift_card=gift_card_created_by_staff,
+        authorized_value=order.total_gross_amount,
+        available_actions=[TransactionAction.CANCEL],
+    )
+
+    assert transaction.authorized_value == order.total_gross_amount
+    assert transaction.charged_value == Decimal(0)
+
+    # when
+    with django_capture_on_commit_callbacks(execute=True):
+        order_confirmed(order, user=customer_user, app=None, manager=manager)
+
+    # then
+    transaction.refresh_from_db()
+    gift_card_created_by_staff.refresh_from_db()
+    order.refresh_from_db()
+
+    assert transaction.authorized_value == Decimal(0)
+    assert transaction.charged_value == order.total_gross_amount
+    assert transaction.available_actions == [TransactionAction.REFUND]
+    assert (
+        gift_card_created_by_staff.current_balance_amount
+        == Decimal(100) - order.total_gross_amount
+    )
+
+    transaction.events.get(type=TransactionEventType.CHARGE_REQUEST)
+    charge_success_event = transaction.events.get(
+        type=TransactionEventType.CHARGE_SUCCESS
+    )
+    assert charge_success_event.message == "Gift card (ending: taff)."
+
+    assert order.authorize_status == OrderAuthorizeStatus.FULL
+    assert order.charge_status == OrderChargeStatus.FULL
+    assert order.total_authorized_amount == Decimal(0)
+    assert order.total_charged_amount == order.total_gross_amount
+
+
+def test_order_confirmed_checks_gift_card_funds_amount_when_charging_funds_authorized_from_gift_card(
+    order_with_lines,
+    django_capture_on_commit_callbacks,
+    customer_user,
+    gift_card_created_by_staff,
+    transaction_item_generator,
+):
+    # given
+    order = order_with_lines
+    manager = get_plugins_manager(False)
+
+    transaction = transaction_item_generator(
+        app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID,
+        order_id=order.pk,
+        gift_card=gift_card_created_by_staff,
+        authorized_value=Decimal(10),
+        available_actions=[TransactionAction.CANCEL],
+    )
+
+    assert transaction.authorized_value == Decimal(10)
+    assert transaction.charged_value == Decimal(0)
+
+    gift_card_created_by_staff.current_balance_amount = Decimal(5)
+    gift_card_created_by_staff.save(update_fields=["current_balance_amount"])
+
+    # when
+    with django_capture_on_commit_callbacks(execute=True):
+        order_confirmed(order, user=customer_user, app=None, manager=manager)
+
+    # then
+    transaction.refresh_from_db()
+    gift_card_created_by_staff.refresh_from_db()
+    order.refresh_from_db()
+
+    assert transaction.authorized_value == Decimal(10)
+    assert transaction.charged_value == Decimal(0)
+    assert transaction.available_actions == [TransactionAction.CANCEL]
+    assert gift_card_created_by_staff.current_balance_amount == Decimal(5)
+
+    transaction.events.get(type=TransactionEventType.CHARGE_REQUEST)
+    charge_success_event = transaction.events.get(
+        type=TransactionEventType.CHARGE_FAILURE
+    )
+    assert (
+        charge_success_event.message
+        == "Gift card has insufficient amount (5.00) to cover requested amount (10.00)."
+    )
+
+    assert order.authorize_status == OrderAuthorizeStatus.PARTIAL
+    assert order.charge_status == OrderChargeStatus.NONE
+    assert order.total_authorized_amount == Decimal(10)
+    assert order.total_charged_amount == Decimal(0)
+
+
+def test_order_confirmed_does_not_charge_the_same_authorized_funds_more_than_once(
+    order_with_lines,
+    django_capture_on_commit_callbacks,
+    customer_user,
+    gift_card_created_by_staff,
+    transaction_item_generator,
+):
+    # given
+    order = order_with_lines
+    manager = get_plugins_manager(False)
+
+    transaction = transaction_item_generator(
+        app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID,
+        order_id=order.pk,
+        gift_card=gift_card_created_by_staff,
+        authorized_value=Decimal(10),
+        available_actions=[TransactionAction.CANCEL],
+    )
+
+    with django_capture_on_commit_callbacks(execute=True):
+        order_confirmed(order, user=customer_user, app=None, manager=manager)
+
+    transaction.refresh_from_db()
+    gift_card_created_by_staff.refresh_from_db()
+    order.refresh_from_db()
+
+    assert transaction.authorized_value == Decimal(0)
+    assert transaction.charged_value == Decimal(10)
+    assert transaction.available_actions == [TransactionAction.REFUND]
+    assert gift_card_created_by_staff.current_balance_amount == Decimal(0)
+
+    assert (
+        transaction.events.filter(type=TransactionEventType.CHARGE_REQUEST).count() == 1
+    )
+    assert (
+        transaction.events.filter(type=TransactionEventType.CHARGE_SUCCESS).count() == 1
+    )
+
+    assert order.authorize_status == OrderAuthorizeStatus.PARTIAL
+    assert order.charge_status == OrderChargeStatus.PARTIAL
+    assert order.total_authorized_amount == Decimal(0)
+    assert order.total_charged_amount == Decimal(10)
+
+    # when
+    with django_capture_on_commit_callbacks(execute=True):
+        order_confirmed(order, user=customer_user, app=None, manager=manager)
+
+    # then
+    transaction.refresh_from_db()
+    gift_card_created_by_staff.refresh_from_db()
+    order.refresh_from_db()
+
+    assert transaction.authorized_value == Decimal(0)
+    assert transaction.charged_value == Decimal(10)
+    assert transaction.available_actions == [TransactionAction.REFUND]
+    assert gift_card_created_by_staff.current_balance_amount == Decimal(0)
+
+    assert (
+        transaction.events.filter(type=TransactionEventType.CHARGE_REQUEST).count() == 1
+    )
+    assert (
+        transaction.events.filter(type=TransactionEventType.CHARGE_SUCCESS).count() == 1
+    )
+
+    assert order.authorize_status == OrderAuthorizeStatus.PARTIAL
+    assert order.charge_status == OrderChargeStatus.PARTIAL
+    assert order.total_authorized_amount == Decimal(0)
+    assert order.total_charged_amount == Decimal(10)

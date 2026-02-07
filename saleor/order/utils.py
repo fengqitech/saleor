@@ -16,6 +16,7 @@ from prices import Money, TaxedMoney
 from ..account.models import User
 from ..account.utils import store_user_address
 from ..checkout import AddressType
+from ..checkout.models import Checkout
 from ..core.prices import quantize_price
 from ..core.taxes import zero_money
 from ..core.tracing import traced_atomic_transaction
@@ -81,7 +82,11 @@ if TYPE_CHECKING:
     from ..payment.models import Payment, TransactionItem
     from ..plugins.manager import PluginsManager
 
+
 logger = logging.getLogger(__name__)
+
+
+PRIVATE_META_APP_SHIPPING_ID = "external_app_shipping_id"
 
 
 def get_order_country(order: Order) -> str:
@@ -132,7 +137,7 @@ def invalidate_order_prices(order: Order, *, save: bool = False) -> None:
     order.should_refresh_prices = True
 
     if save:
-        order.save(update_fields=["should_refresh_prices"])
+        order.save(update_fields=["should_refresh_prices", "updated_at"])
 
 
 def recalculate_order_weight(order: Order, *, save: bool = False):
@@ -495,6 +500,13 @@ def add_gift_cards_to_order(
     ]
     GiftCard.objects.bulk_update(gift_cards_to_update, update_fields)
     gift_card_events.gift_cards_used_in_order_event(balance_data, order, user, app)
+
+    # Invalidate prices for checkouts attached to gift cards used by this order.
+    # This will ensure the checkout status gets recalculcated to accomodate gift cards
+    # balance changes.
+    Checkout.objects.filter(gift_cards__in=gift_cards_to_update).exclude(
+        token=checkout_info.checkout.token
+    ).update(price_expiration=timezone.now())
 
     gift_card_compensation = total_before_gift_card_compensation - total_price_left
     if gift_card_compensation.amount > 0:
@@ -1406,3 +1418,9 @@ def calculate_draft_order_line_price_expiration_date(
         now = timezone.now()
         return now + timedelta(hours=freeze_period)
     return None
+
+
+def get_external_shipping_id(order: "Order"):
+    if not order:
+        return None
+    return order.get_value_from_private_metadata(PRIVATE_META_APP_SHIPPING_ID)

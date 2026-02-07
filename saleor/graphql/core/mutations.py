@@ -21,6 +21,7 @@ from graphene.types.mutation import MutationOptions
 from graphql.error import GraphQLError
 
 from ...core.db.connection import allow_writer
+from ...core.error_codes import UploadErrorCode
 from ...core.exceptions import PermissionDenied
 from ...core.utils import metadata_manager
 from ...core.utils.events import call_event
@@ -58,6 +59,9 @@ from .utils import (
     snake_to_camel_case,
 )
 from .utils.error_codes import get_error_code_from_error
+from .validators.file import validate_upload_file
+
+MISSING_NODE_ERROR_MESSAGE_PREFIX = "Couldn't resolve to a node:"
 
 
 def get_model_name(model):
@@ -371,7 +375,7 @@ class BaseMutation(graphene.Mutation):
                 raise ValidationError(
                     {
                         field: ValidationError(
-                            f"Couldn't resolve to a node: {node_id}", code=code
+                            f"{MISSING_NODE_ERROR_MESSAGE_PREFIX} {node_id}", code=code
                         )
                     }
                 )
@@ -690,7 +694,9 @@ class DeprecatedModelMutation(BaseMutation):
                 f"GraphQL type for model {cls._meta.model.__name__} could not be "
                 f"resolved for {cls.__name__}"
             )
-        fields = {return_field_name: graphene.Field(model_type)}
+        fields = {}
+        if not cls._meta.fields.get(return_field_name):
+            fields[return_field_name] = graphene.Field(model_type)
 
         cls._update_mutation_arguments_and_fields(arguments=arguments, fields=fields)
 
@@ -1200,6 +1206,8 @@ class FileUpload(BaseMutation):
         file_data: UploadedFile = cast(UploadedFile, info.context.FILES[file])
         if not file_data.file:
             raise ValidationError("Received an empty file.")
+
+        validate_upload_file(file_data, UploadErrorCode, "file")
 
         # add unique text fragment to the file name to prevent file overriding
         file_name, format = os.path.splitext(file_data.name or "")

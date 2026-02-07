@@ -2,11 +2,12 @@ from unittest.mock import ANY, patch
 from urllib.parse import urlencode
 
 from django.test import override_settings
+from django.utils import timezone
+from freezegun import freeze_time
 
 from ......account import events as account_events
 from ......account.models import User
 from ......account.notifications import get_default_user_payload
-from ......account.search import generate_user_fields_search_document_value
 from ......account.tasks import finish_creating_user
 from ......core.notify import NotifyEventType
 from ......core.tests.utils import get_site_context_payload
@@ -16,25 +17,81 @@ from ......tests import race_condition
 from .....tests.utils import get_graphql_content
 
 ACCOUNT_REGISTER_MUTATION = """
-    mutation RegisterAccount(
-        $input: AccountRegisterInput!
-    ) {
-        accountRegister(
-            input: $input
-        ) {
-            errors {
-                field
-                message
-                code
-            }
-            user {
-                id
-                email
-                firstName
-                lastName
-            }
-        }
+mutation RegisterAccount($input: AccountRegisterInput!) {
+  accountRegister(input: $input) {
+    errors {
+      field
+      message
+      code
     }
+    user {
+      id
+      email
+      firstName
+      lastName
+      addresses {
+        streetAddress1
+      }
+      metadata {
+        key
+      }
+      metafield(key: "test")
+      metafields(keys: ["test1"])
+      checkout{
+        id
+      }
+      checkoutTokens
+      checkoutIds
+      checkouts(first: 10) {
+        edges {
+          node {
+            id
+          }
+        }
+      }
+      giftCards(first: 1) {
+        edges {
+          node {
+            id
+          }
+        }
+      }
+      orders(first: 1) {
+        edges {
+          node {
+            id
+          }
+        }
+      }
+      userPermissions {
+        code
+      }
+      storedPaymentMethods(channel: "default-channel") {
+        id
+      }
+      dateJoined
+      lastLogin
+      externalReference
+      defaultBillingAddress {
+        id
+      }
+      defaultShippingAddress {
+        id
+      }
+      languageCode
+      storedPaymentSources {
+        __typename
+      }
+      avatar {
+        url
+      }
+      isStaff
+      isActive
+      isConfirmed
+      updatedAt
+    }
+  }
+}
 """
 
 
@@ -102,9 +159,7 @@ def test_customer_register(
     assert new_user.language_code == "pl"
     assert new_user.first_name == variables["input"]["firstName"]
     assert new_user.last_name == variables["input"]["lastName"]
-    assert new_user.search_document == generate_user_fields_search_document_value(
-        new_user
-    )
+    assert new_user.search_vector
     assert not data["errors"]
     assert mocked_notify.call_count == 1
     call_args = mocked_notify.call_args_list[0]
@@ -165,6 +220,8 @@ def test_customer_register_twice(
     data = content["data"][mutation_name]
     params = urlencode({"email": email, "token": "token"})
     confirm_url = prepare_url(params, redirect_url)
+    new_user.last_login = timezone.now()
+    new_user.save()
 
     expected_payload = {
         "user": get_default_user_payload(new_user),
@@ -182,9 +239,7 @@ def test_customer_register_twice(
     assert new_user.language_code == "pl"
     assert new_user.first_name == variables["input"]["firstName"]
     assert new_user.last_name == variables["input"]["lastName"]
-    assert new_user.search_document == generate_user_fields_search_document_value(
-        new_user
-    )
+    assert new_user.search_vector
     assert not data["errors"]
     assert mocked_notify.call_count == 1
     call_args = mocked_notify.call_args_list[0]
@@ -201,18 +256,28 @@ def test_customer_register_twice(
     # remove personal data from input
     del variables["input"]["firstName"]
     del variables["input"]["lastName"]
-    response = api_client.post_graphql(query, variables)
-    content = get_graphql_content(response)
-    data = content["data"][mutation_name]
+    with freeze_time("2025-06-01 12:00:01"):
+        query_time = timezone.now()
+        response = api_client.post_graphql(query, variables)
+        content = get_graphql_content(response)
+        data = content["data"][mutation_name]
 
     # then
     assert not data["errors"]
+
+    new_user.refresh_from_db()
+    assert new_user.updated_at != query_time
+    assert new_user.date_joined != query_time
+    assert new_user.last_login is not None
 
     customer_creation_event = account_events.CustomerEvent.objects.get()
     assert data["user"]["firstName"] == ""
     assert data["user"]["lastName"] == ""
     assert data["user"]["email"] == variables["input"]["email"]
     assert data["user"]["id"] == ""
+    assert data["user"]["updatedAt"] == query_time.isoformat()
+    assert data["user"]["dateJoined"] == query_time.isoformat()
+    assert data["user"]["lastLogin"] is None
     assert customer_creation_event.type == account_events.CustomerEvents.ACCOUNT_CREATED
     assert customer_creation_event.user == new_user
     assert mocked_finish_creating_user.delay.call_count == 2

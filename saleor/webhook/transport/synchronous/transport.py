@@ -59,6 +59,8 @@ from ..utils import (
 )
 
 if TYPE_CHECKING:
+    from ....graphql.core.context import SaleorContext
+    from ....graphql.core.dataloaders import DataLoader
     from ....webhook.models import Webhook
 
 R = TypeVar("R")
@@ -117,7 +119,14 @@ def _send_webhook_request_sync(
 
     if parts.scheme.lower() not in [WebhookSchemes.HTTP, WebhookSchemes.HTTPS]:
         delivery_update(delivery, EventDeliveryStatus.FAILED)
-        record_external_request(webhook.target_url, response, payload_size)
+        record_external_request(
+            delivery.event_type,
+            webhook.target_url,
+            response,
+            payload_size,
+            webhook.app,
+            sync=True,
+        )
         raise ValueError(f"Unknown webhook scheme: {parts.scheme!r}")
 
     logger.debug(
@@ -129,7 +138,7 @@ def _send_webhook_request_sync(
         attempt = create_attempt(delivery=delivery, task_id=None, with_save=False)
 
     with webhooks_otel_trace(
-        delivery.event_type, payload_size, sync=True, app=webhook.app
+        delivery.event_type, payload_size, webhook.app, sync=True
     ) as span:
         try:
             response = send_webhook_using_http(
@@ -169,7 +178,14 @@ def _send_webhook_request_sync(
         finally:
             if response.status == EventDeliveryStatus.FAILED:
                 span.set_status(StatusCode.ERROR)
-            record_external_request(webhook.target_url, response, payload_size)
+            record_external_request(
+                delivery.event_type,
+                webhook.target_url,
+                response,
+                payload_size,
+                webhook.app,
+                sync=True,
+            )
 
     attempt_update(attempt, response)
     delivery_update(delivery, response.status)
@@ -276,8 +292,9 @@ def create_delivery_for_subscription_sync_event(
 
     if not request:
         request = initialize_request(
-            requestor,
-            event_type in WebhookEventSyncType.ALL,
+            app=webhook.app,
+            requestor=requestor,
+            sync_event=event_type in WebhookEventSyncType.ALL,
             event_type=event_type,
             allow_replica=allow_replica,
         )
@@ -287,7 +304,6 @@ def create_delivery_for_subscription_sync_event(
             subscribable_object=subscribable_object,
             subscription_query=webhook.subscription_query,
             request=request,
-            app=webhook.app,
         )
     else:
         data = pregenerated_payload
@@ -381,13 +397,21 @@ def trigger_taxes_all_webhooks_sync(
     webhooks = get_webhooks_for_event(event_type)
     request_context = None
     event_payload = None
+
+    dataloaders: dict[str, type[DataLoader]] = {}
+    request_map: dict[int, SaleorContext] = {}
+    is_sync_event = event_type in WebhookEventSyncType.ALL
+
     for webhook in webhooks:
         if webhook.subscription_query:
-            if request_context is None:
+            request_context = request_map.get(webhook.app_id)
+            if not request_context:
                 request_context = initialize_request(
-                    requestor,
-                    event_type in WebhookEventSyncType.ALL,
+                    app=webhook.app,
+                    requestor=requestor,
+                    sync_event=is_sync_event,
                     event_type=event_type,
+                    dataloaders=dataloaders,
                 )
 
             pregenerated_payload = get_pregenerated_subscription_payload(

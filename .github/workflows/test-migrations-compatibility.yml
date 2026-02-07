@@ -7,6 +7,7 @@ on:
       - "main"
     paths:
       - "**/migrations/**"
+      - .github/workflows/test-migrations-compatibility.yml
 
 env:
   DATABASE_URL: "postgres://saleor:saleor@postgres:5432/saleor"
@@ -19,7 +20,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres
+        image: library/postgres:15-alpine
         env:
           POSTGRES_PASSWORD: saleor
           POSTGRES_USER: saleor
@@ -30,13 +31,13 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
           apt-get install -y libpq-dev
 
-      - uses: astral-sh/setup-uv@4959332f0f014c5280e7eac8b70c90cb574c9f9b # v6.0.0
+      - uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.0.0
         with:
           enable-cache: true
 
@@ -51,7 +52,7 @@ jobs:
           uv run python manage.py migrate
 
       - name: Checkout base
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github['base_ref'] }}
 

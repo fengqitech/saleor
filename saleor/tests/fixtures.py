@@ -125,6 +125,20 @@ def get_test_metrics_data(initialize_test_telemetry):
     meter._meter.metric_reader.get_metrics_data()
 
 
+@pytest.fixture(autouse=True)
+def clear_telemetry_data(initialize_test_telemetry):
+    """Clear telemetry data after each test.
+
+    Tests may execute code that produces metrics and/or traces. In our test suite
+    in-memory metric reader and in-memory span exporter are used. If they're not flushed
+    regularly we may end up with substantial amount of data stored in memory for no
+    reason.
+    """
+    yield
+    meter._meter.metric_reader.get_metrics_data()
+    tracer._tracer.span_exporter.clear()
+
+
 @pytest.fixture
 def capture_queries(pytestconfig):
     cfg = pytestconfig
@@ -595,9 +609,10 @@ def description_json():
                 "key": "",
                 "data": {
                     "text": "E-commerce for the PWA era",
+                    "level": 2,
                 },
                 "text": "E-commerce for the PWA era",
-                "type": "header-two",
+                "type": "header",
                 "depth": 0,
                 "entityRanges": [],
                 "inlineStyleRanges": [],
@@ -681,9 +696,10 @@ def other_description_json():
                     "text": (
                         "A GRAPHQL-FIRST <b>ECOMMERCE</b> PLATFORM FOR PERFECTIONISTS"
                     ),
+                    "level": 2,
                 },
                 "text": "A GRAPHQL-FIRST ECOMMERCE PLATFORM FOR PERFECTIONISTS",
-                "type": "header-two",
+                "type": "header",
                 "depth": 0,
                 "entityRanges": [],
                 "inlineStyleRanges": [],
@@ -1239,6 +1255,7 @@ def async_subscription_webhooks_with_root_objects(
     subscription_collection_metadata_updated_webhook,
     subscription_checkout_created_webhook,
     subscription_checkout_updated_webhook,
+    subscription_checkout_fully_authorized_webhook,
     subscription_checkout_fully_paid_webhook,
     subscription_checkout_metadata_updated_webhook,
     subscription_page_created_webhook,
@@ -1525,6 +1542,10 @@ def async_subscription_webhooks_with_root_objects(
         events.CHECKOUT_UPDATED: [subscription_checkout_updated_webhook, checkout],
         events.CHECKOUT_FULLY_PAID: [
             subscription_checkout_fully_paid_webhook,
+            checkout,
+        ],
+        events.CHECKOUT_FULLY_AUTHORIZED: [
+            subscription_checkout_fully_authorized_webhook,
             checkout,
         ],
         events.CHECKOUT_METADATA_UPDATED: [

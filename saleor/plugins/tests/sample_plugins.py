@@ -269,6 +269,7 @@ class PluginSample(BasePlugin):
     def get_order_line_tax_rate(
         self,
         order: "Order",
+        order_line: "OrderLine",
         product: "Product",
         variant: "ProductVariant",
         address: Optional["Address"],
@@ -339,6 +340,9 @@ class PluginSample(BasePlugin):
     def checkout_fully_paid(self, checkout, previous_value, webhooks):
         return None
 
+    def checkout_fully_authorized(self, checkout, previous_value, webhooks):
+        return None
+
     def order_fully_refunded(self, order, previous_value, webhooks):
         return None
 
@@ -368,7 +372,10 @@ class PluginSample(BasePlugin):
         return previous_value
 
     def get_shipping_methods_for_checkout(
-        self, checkout: "Checkout", previous_value: Any
+        self,
+        checkout: "Checkout",
+        built_in_shipping_methods: list["ShippingMethodData"],
+        previous_value: Any,
     ) -> list["ShippingMethodData"]:
         different_currency = "EUR"
         assert checkout.currency != different_currency

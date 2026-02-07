@@ -5,6 +5,7 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from .....app.models import App
+from .....checkout.models import Checkout
 from .....core.exceptions import PermissionDenied
 from .....core.prices import quantize_price
 from .....core.tracing import traced_atomic_transaction
@@ -25,6 +26,7 @@ from .....payment.utils import (
     create_failed_transaction_event,
     get_already_existing_event,
     get_transaction_event_amount,
+    invalidate_cache_for_stored_payment_methods_if_needed,
     process_order_or_checkout_with_transaction,
     truncate_transaction_event_message,
     update_transaction_item_with_payment_method_details,
@@ -247,7 +249,7 @@ class TransactionEventReport(DeprecatedModelMutation):
             fields_to_update.append("app")
             fields_to_update.append("app_identifier")
         transaction.save(update_fields=fields_to_update)
-        if metadata:
+        if metadata or private_metadata:
             call_event(manager.transaction_item_metadata_updated, transaction)
 
     @classmethod
@@ -473,6 +475,24 @@ class TransactionEventReport(DeprecatedModelMutation):
                 )
             if updated_fields:
                 transaction.save(update_fields=updated_fields)
+
+        app_identifier = app_identifier or transaction.app_identifier
+
+        source_object: Checkout | order_models.Order | None = None
+        if transaction.checkout_id:
+            source_object = Checkout.objects.filter(pk=transaction.checkout_id).first()
+        if not source_object:
+            # Prevent race condition between TransactionEventReport and checkout completion
+            source_object = order_models.Order.objects.filter(
+                pk__in=payment_models.TransactionItem.objects.filter(
+                    pk=transaction.pk
+                ).values_list("order_id", flat=True)
+            ).first()
+
+        if app_identifier and source_object:
+            invalidate_cache_for_stored_payment_methods_if_needed(
+                transaction_event, source_object, app_identifier
+            )
 
         return cls(
             already_processed=already_processed,

@@ -68,6 +68,7 @@ from ..enums import (
     ProductTranslateErrorCode,
     ProductVariantBulkErrorCode,
     ProductVariantTranslateErrorCode,
+    RefundSettingsErrorCode,
     SendConfirmationEmailErrorCode,
     ShippingErrorCode,
     ShopErrorCode,
@@ -117,10 +118,7 @@ class NonNullList(graphene.List):
 class SecureGlobalID(graphene.GlobalID):
     @staticmethod
     def id_resolver(parent_resolver, node, root, info, parent_type_name=None, **args):
-        if (
-            hasattr(root, "RETURN_ID_IN_API_RESPONSE")
-            and not root.RETURN_ID_IN_API_RESPONSE
-        ):
+        if hasattr(root, "NEWLY_CREATED_USER") and root.NEWLY_CREATED_USER:
             return ""
         return graphene.GlobalID.id_resolver(
             parent_resolver, node, root, info, parent_type_name, **args
@@ -185,7 +183,7 @@ class BulkError(BaseObjectType):
 
 class AccountError(Error):
     code = AccountErrorCode(description="The error code.", required=True)
-    address_type = AddressTypeEnum(  # type: ignore[has-type]
+    address_type = AddressTypeEnum(
         description="A type of address that causes the error.", required=False
     )
 
@@ -270,7 +268,7 @@ class CheckoutError(Error):
         description="List of line Ids which cause the error.",
         required=False,
     )
-    address_type = AddressTypeEnum(  # type: ignore[has-type]
+    address_type = AddressTypeEnum(
         description="A type of address that causes the error.", required=False
     )
 
@@ -355,6 +353,24 @@ class GiftCardSettingsError(Error):
         doc_category = DOC_CATEGORY_GIFT_CARDS
 
 
+class RefundSettingsUpdateError(Error):
+    code = RefundSettingsErrorCode(
+        description="Failed to update Refund Settings", required=True
+    )
+
+    class Meta:
+        doc_category = DOC_CATEGORY_SHOP
+
+
+class RefundReasonReferenceTypeClearError(Error):
+    code = RefundSettingsErrorCode(
+        description="Failed to clear refund reason reference type", required=True
+    )
+
+    class Meta:
+        doc_category = DOC_CATEGORY_SHOP
+
+
 class MetadataError(Error):
     code = MetadataErrorCode(description="The error code.", required=True)
 
@@ -375,7 +391,7 @@ class OrderError(Error):
         description="List of product variants that are associated with the error",
         required=False,
     )
-    address_type = AddressTypeEnum(  # type: ignore[has-type]
+    address_type = AddressTypeEnum(
         description="A type of address that causes the error.", required=False
     )
 

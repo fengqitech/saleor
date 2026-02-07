@@ -1,13 +1,14 @@
+import decimal
 import hashlib
 import importlib
-import json
 from inspect import isclass
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urljoin
 
+import orjson
 from django.conf import settings
 from django.core.cache import cache
-from django.http import HttpRequest, HttpResponseNotAllowed, JsonResponse
+from django.http import HttpRequest, HttpResponse, HttpResponseNotAllowed
 from django.shortcuts import render
 from django.views.generic import View
 from graphql import GraphQLBackend, GraphQLDocument, GraphQLSchema
@@ -31,9 +32,11 @@ from .. import __version__ as saleor_version
 from ..core.exceptions import PermissionDenied
 from ..core.telemetry import Scope, SpanKind, saleor_attributes, tracer
 from ..webhook import observability
+from . import GraphQLOperationResult
 from .api import API_PATH, schema
 from .context import clear_context, get_context_value
 from .core.validators.query_cost import validate_query_cost
+from .error import clear_errors
 from .metrics import (
     record_graphql_query_cost,
     record_graphql_query_count,
@@ -51,6 +54,29 @@ from .utils import (
 from .utils.validators import check_if_query_contains_only_schema
 
 INT_ERROR_MSG = "Int cannot represent non 32-bit signed integer value"
+
+
+def default_serializer(obj):
+    if isinstance(obj, decimal.Decimal):
+        return str(obj)
+    raise TypeError
+
+
+class JsonResponse(HttpResponse):
+    def __init__(
+        self,
+        data,
+        safe=True,
+        **kwargs,
+    ):
+        if safe and not isinstance(data, dict):
+            raise TypeError(
+                "In order to allow non-dict objects to be serialized set the "
+                "safe parameter to False."
+            )
+        kwargs.setdefault("content_type", "application/json")
+        data = orjson.dumps(data, option=orjson.OPT_UTC_Z, default=default_serializer)
+        super().__init__(content=data, **kwargs)
 
 
 class GraphQLView(View):
@@ -149,9 +175,10 @@ class GraphQLView(View):
                 status=400,
             )
 
+        result: GraphQLOperationResult | None | list[GraphQLOperationResult | None]
         if isinstance(data, list):
             responses = [self.get_response(request, entry) for entry in data]
-            result: list | dict | None = [response for response, code in responses]
+            result = [response for response, code in responses]
             status_code = max((code for response, code in responses), default=200)
         else:
             result, status_code = self.get_response(request, data)
@@ -211,27 +238,26 @@ class GraphQLView(View):
 
     def get_response(
         self, request: HttpRequest, data: dict
-    ) -> tuple[dict[str, list[Any]] | None, int]:
+    ) -> tuple[GraphQLOperationResult | None, int]:
         with observability.report_gql_operation() as operation:
             execution_result = self.execute_graphql_request(request, data)
             status_code = 200
-            if execution_result:
-                response = {}
-                if execution_result.errors:
-                    response["errors"] = [
-                        self.format_error(e) for e in execution_result.errors
-                    ]
-                if execution_result.invalid:
-                    status_code = 400
-                else:
-                    response["data"] = execution_result.data
-                if execution_result.extensions:
-                    response["extensions"] = execution_result.extensions
-                result: dict[str, list[Any]] | None = response
+            result: GraphQLOperationResult = {}
+            if execution_result.errors:
+                result["errors"] = [
+                    self.format_error(e) for e in execution_result.errors
+                ]
+                # Error handling form `GraphQL-Core-Legacy` creates a multiple references cycles in
+                # the error object. We need to clear them.
+                clear_errors(execution_result.errors)
+            if execution_result.invalid:
+                status_code = 400
             else:
-                result = None
-            operation.result = result
+                result["data"] = execution_result.data
+            if execution_result.extensions:
+                result["extensions"] = execution_result.extensions
             operation.result_invalid = execution_result.invalid
+            operation.result = dict(result)
         return result, status_code
 
     def get_root_value(self):
@@ -239,7 +265,7 @@ class GraphQLView(View):
 
     def parse_query(
         self, query: str | None
-    ) -> tuple[GraphQLDocument | None, ExecutionResult | None]:
+    ) -> tuple[GraphQLDocument, None] | tuple[None, ExecutionResult]:
         """Attempt to parse a query (mandatory) to a gql document object.
 
         If no query was given or query is not a string, it returns an error.
@@ -263,7 +289,9 @@ class GraphQLView(View):
         except (ValueError, GraphQLSyntaxError) as e:
             return None, ExecutionResult(errors=[e], invalid=True)
 
-    def execute_graphql_request(self, request: HttpRequest, data: dict):
+    def execute_graphql_request(
+        self, request: HttpRequest, data: dict
+    ) -> ExecutionResult:
         with (
             tracer.start_as_current_span(
                 "GraphQL Operation", scope=Scope.SERVICE
@@ -281,7 +309,7 @@ class GraphQLView(View):
                 operation.name = operation_name
                 operation.variables = variables
 
-            if error or document is None:
+            if error:
                 error_description = self.format_span_error_description(error)
                 error_type = (
                     error.errors[0].__class__.__name__
@@ -296,6 +324,7 @@ class GraphQLView(View):
                     )
                     query_duration_attrs[error_attributes.ERROR_TYPE] = error_type
                 return error
+            document = cast(GraphQLDocument, document)
 
             try:
                 query_contains_schema = check_if_query_contains_only_schema(document)
@@ -334,12 +363,12 @@ class GraphQLView(View):
             span.set_attribute(
                 saleor_attributes.GRAPHQL_OPERATION_IDENTIFIER, operation_identifier
             )
-            query_duration_attrs[saleor_attributes.GRAPHQL_OPERATION_IDENTIFIER] = (
-                operation_identifier
-            )
             span.set_attribute(
                 saleor_attributes.GRAPHQL_DOCUMENT_FINGERPRINT,
                 operation_fingerprint,
+            )
+            query_duration_attrs[saleor_attributes.GRAPHQL_DOCUMENT_FINGERPRINT] = (
+                operation_fingerprint
             )
 
             source_service_name = get_source_service_name_value(
@@ -365,17 +394,11 @@ class GraphQLView(View):
                 span.set_status(status=StatusCode.ERROR, description=error_description)
                 error_type = cost_errors[0].__class__.__name__ if cost_errors else None
                 record_graphql_query_count(
-                    operation_name=operation_name,
-                    operation_identifier=operation_identifier,
                     operation_type=operation_type,
                     error_type=error_type,
                 )
                 record_graphql_query_cost(
-                    query_cost,
-                    operation_name=operation_name,
-                    operation_identifier=operation_identifier,
-                    operation_type=operation_type,
-                    error_type=error_type,
+                    query_cost, operation_type=operation_type, error_type=error_type
                 )
                 if error_type:
                     query_duration_attrs[error_attributes.ERROR_TYPE] = error_type
@@ -423,15 +446,11 @@ class GraphQLView(View):
                         cache.set(key, response)
 
                 record_graphql_query_count(
-                    operation_name=operation_name,
-                    operation_identifier=operation_identifier,
                     operation_type=operation_type,
                     error_type=error_type,
                 )
                 record_graphql_query_cost(
                     query_cost,
-                    operation_name=operation_name,
-                    operation_identifier=operation_identifier,
                     operation_type=operation_type,
                     error_type=error_type,
                 )
@@ -448,15 +467,11 @@ class GraphQLView(View):
                     e = GraphQLError(str(e))
                 error_type = e.__class__.__name__
                 record_graphql_query_count(
-                    operation_name=operation_name,
-                    operation_identifier=operation_identifier,
                     operation_type=operation_type,
                     error_type=error_type,
                 )
                 record_graphql_query_cost(
                     query_cost,
-                    operation_name=operation_name,
-                    operation_identifier=operation_identifier,
                     operation_type=operation_type,
                     error_type=error_type,
                 )
@@ -471,8 +486,8 @@ class GraphQLView(View):
         if content_type == "application/graphql":
             return {"query": request.body.decode("utf-8")}
         if content_type == "application/json":
-            body = request.body.decode("utf-8")
-            return json.loads(body)
+            body = request.body
+            return orjson.loads(body)
         if content_type in ["application/x-www-form-urlencoded", "multipart/form-data"]:
             return request.POST
         return {}
@@ -486,8 +501,8 @@ class GraphQLView(View):
             operation_name = None
 
         if request.content_type == "multipart/form-data":
-            operations = json.loads(data.get("operations", "{}"))
-            files_map = json.loads(data.get("map", "{}"))
+            operations = orjson.loads(data.get("operations", "{}"))
+            files_map = orjson.loads(data.get("map", "{}"))
             for file_key in files_map:
                 # file key is which file it is in the form-data
                 file_instances = files_map[file_key]
@@ -495,6 +510,12 @@ class GraphQLView(View):
                     obj_set(operations, file_instance, file_key, False)
             query = operations.get("query")
             variables = operations.get("variables")
+        if not isinstance(query, str):
+            query = None
+        if not isinstance(variables, dict):
+            variables = None
+        if not isinstance(operation_name, str):
+            operation_name = None
         return query, variables, operation_name
 
     def format_error(self, error):
@@ -563,6 +584,10 @@ def instantiate_middleware(middlewares):
 
 def generate_cache_key(raw_query: str) -> str:
     hashed_query = hashlib.sha256(str(raw_query).encode("utf-8")).hexdigest()
+
+    if settings.GRAPHQL_CACHE_SUFFIX:
+        return f"{saleor_version}-{hashed_query}-{settings.GRAPHQL_CACHE_SUFFIX}"
+
     return f"{saleor_version}-{hashed_query}"
 
 

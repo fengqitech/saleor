@@ -545,6 +545,15 @@ class BasePlugin:
     # Webhook-related functionality will be moved from the plugin to core modules.
     checkout_fully_paid: Callable[["Checkout", Any, None], Any]
 
+    # Trigger when checkout is fully authorized with transactions.
+    #
+    # Overwrite this method if you need to trigger specific logic when a checkout is
+    # updated.
+    #
+    # Note: This method is deprecated and will be removed in a future release.
+    # Webhook-related functionality will be moved from the plugin to core modules.
+    checkout_fully_authorized: Callable[["Checkout", Any, None], Any]
+
     # Trigger when checkout metadata is updated.
     #
     # Overwrite this method if you need to trigger specific logic when a checkout
@@ -732,7 +741,14 @@ class BasePlugin:
     get_client_token: Callable[[Any, Any], Any]
 
     get_order_line_tax_rate: Callable[
-        ["Order", "Product", "ProductVariant", Union["Address", None], Decimal],
+        [
+            "Order",
+            "OrderLine",
+            "Product",
+            "ProductVariant",
+            Union["Address", None],
+            Decimal,
+        ],
         Decimal,
     ]
 
@@ -742,7 +758,7 @@ class BasePlugin:
     # Note: This method is deprecated and will be removed in a future release.
     # Webhook-related functionality will be moved from the plugin to core modules.
     get_shipping_methods_for_checkout: Callable[
-        ["Checkout", Any], list["ShippingMethodData"]
+        ["Checkout", list["ShippingMethodData"], Any], list["ShippingMethodData"]
     ]
 
     get_supported_currencies: Callable[[Any], Any]

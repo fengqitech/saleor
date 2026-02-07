@@ -21,13 +21,14 @@ env:
 
 jobs:
   e2e-tests:
+    if: ${{ github.event_name != 'schedule' || github.repository == 'saleor/saleor' }}
     runs-on: ubuntu-22.04
     container: python:3.12
     name: Run E2E tests
 
     services:
       postgres:
-        image: postgres
+        image: library/postgres:15-alpine
         env:
           POSTGRES_PASSWORD: saleor
           POSTGRES_USER: saleor
@@ -38,13 +39,13 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
           apt-get install -y libpq-dev
 
-      - uses: astral-sh/setup-uv@4959332f0f014c5280e7eac8b70c90cb574c9f9b # v6.0.0
+      - uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.0.0
         with:
           enable-cache: true
 
@@ -58,7 +59,7 @@ jobs:
 
       - name: Surface failing tests
         if: always()
-        uses: pmeier/pytest-results-action@4c22f3314dfc484aaad53353d3dd8dddf5de6b46 # v0.5.0
+        uses: pmeier/pytest-results-action@20b595761ba9bf89e115e875f8bc863f913bc8ad # v0.7.2
         with:
           path: e2e-test-results.xml
           summary: true

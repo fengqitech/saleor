@@ -19,7 +19,7 @@ from ....product.models import (
     VariantChannelListingPromotionRule,
     VariantMedia,
 )
-from ...channel.dataloaders import ChannelBySlugLoader
+from ...channel.dataloaders.by_self import ChannelBySlugLoader
 from ...core.dataloaders import BaseThumbnailBySizeAndFormatLoader, DataLoader
 
 ProductIdAndChannelSlug = tuple[int, str]
@@ -383,6 +383,29 @@ class VariantChannelListingByVariantIdAndChannelIdLoader(
             (variant_id, variant_channel_listings_map.get(variant_id))
             for variant_id in variant_ids
         ]
+
+
+class VariantChannelListingsByProductIdLoader(
+    DataLoader[int, Iterable[ProductVariantChannelListing]]
+):
+    context_key = "variantchannelistings_by_product_id"
+
+    def batch_load(self, keys: Iterable[int]):
+        variants_channel_listings = (
+            ProductVariantChannelListing.objects.all()
+            .using(self.database_connection_name)
+            .filter(
+                variant__product_id__in=keys,
+                price_amount__isnull=False,
+            )
+            .annotate(product_id=F("variant__product_id"))
+            .order_by("pk")
+        )
+        listing_map = defaultdict(list)
+        for listing in variants_channel_listings.iterator(chunk_size=1000):
+            listing_map[listing.product_id].append(listing)
+
+        return [listing_map[key] for key in keys]
 
 
 class VariantsChannelListingByProductIdAndChannelSlugLoader(

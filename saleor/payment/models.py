@@ -176,6 +176,12 @@ class TransactionItem(ModelWithMetadata):
     )
     payment_method_name = models.CharField(max_length=256, blank=True, null=True)
 
+    gift_card = models.ForeignKey(
+        "giftcard.GiftCard",
+        null=True,
+        on_delete=models.SET_NULL,
+    )
+
     class Meta:
         ordering = ("pk",)
         indexes = [
@@ -238,6 +244,10 @@ class TransactionEvent(models.Model):
         blank=True,
         null=True,
         on_delete=models.SET_NULL,
+    )
+
+    reason_reference = models.ForeignKey(
+        "page.Page", related_name="+", on_delete=models.SET_NULL, blank=True, null=True
     )
 
     class Meta:

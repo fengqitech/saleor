@@ -9,6 +9,7 @@ from ...app.utils import get_active_tax_apps
 from ...channel import models as channel_models
 from ...core.models import ModelWithMetadata
 from ...core.utils import build_absolute_uri, get_domain, is_ssl_enabled
+from ...payment.gateway import get_payment_gateways
 from ...permission.auth_filters import AuthorizationFilters
 from ...permission.enums import AppPermission, SitePermissions, get_permissions
 from ...site import models as site_models
@@ -18,6 +19,7 @@ from ..core import ResolveInfo
 from ..core.context import get_database_connection_name
 from ..core.descriptions import (
     ADDED_IN_319,
+    ADDED_IN_322,
     DEFAULT_DEPRECATION_REASON,
     DEPRECATED_IN_3X_INPUT,
 )
@@ -40,6 +42,7 @@ from ..core.types import (
 )
 from ..core.utils import str_to_enum
 from ..meta.types import ObjectWithMetadata
+from ..page.types import PageType
 from ..payment.types import PaymentGateway
 from ..plugins.dataloaders import plugin_manager_promise_callback
 from ..shipping.types import ShippingMethod
@@ -79,6 +82,21 @@ class OrderSettings(ModelObjectType[site_models.SiteSettings]):
         model = site_models.SiteSettings
 
 
+class RefundSettings(ModelObjectType[site_models.SiteSettings]):
+    reason_reference_type = graphene.Field(
+        PageType, description="Model type used for refund reasons."
+    )
+
+    class Meta:
+        description = "Refund related settings from site settings." + ADDED_IN_322
+        doc_category = DOC_CATEGORY_ORDERS
+        model = site_models.SiteSettings
+
+    @staticmethod
+    def resolve_reason_reference_type(root, info):
+        return root.refund_reason_reference_type
+
+
 class GiftCardSettings(ModelObjectType[site_models.SiteSettings]):
     expiry_type = GiftCardSettingsExpiryTypeEnum(
         description="The gift card expiry type settings.", required=True
@@ -92,9 +110,11 @@ class GiftCardSettings(ModelObjectType[site_models.SiteSettings]):
         doc_category = DOC_CATEGORY_GIFT_CARDS
         model = site_models.SiteSettings
 
+    @staticmethod
     def resolve_expiry_type(root, info):
         return root.gift_card_expiry_type
 
+    @staticmethod
     def resolve_expiry_period(root, info):
         if root.gift_card_expiry_period_type is None:
             return None
@@ -369,6 +389,19 @@ class Shop(graphene.ObjectType):
         required=True,
     )
 
+    # legacy settings
+    use_legacy_update_webhook_emission = graphene.Boolean(
+        description=(
+            "Use legacy update webhook emission. "
+            "When enabled, update webhooks (e.g. `customerUpdated`,"
+            "`productVariantUpdated`) are sent even when only metadata changes. "
+            "When disabled, update webhooks are not sent for metadata-only changes; "
+            "only metadata-specific webhooks (e.g., `customerMetadataUpdated`, "
+            "`productVariantMetadataUpdated`) are sent." + ADDED_IN_322
+        ),
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
+    )
+
     class Meta:
         description = (
             "Represents a shop resource containing general shop data and configuration."
@@ -397,7 +430,11 @@ class Shop(graphene.ObjectType):
     def resolve_available_payment_gateways(
         _, _info, manager, currency: str | None = None, channel: str | None = None
     ):
-        return manager.list_payment_gateways(currency=currency, channel_slug=channel)
+        return get_payment_gateways(
+            manager=manager,
+            currency=currency,
+            channel_slug=channel,
+        )
 
     @staticmethod
     @traced_resolver
@@ -637,3 +674,8 @@ class Shop(graphene.ObjectType):
         return ObjectWithMetadata.resolve_private_metafields(
             site.settings, info, keys=keys
         )
+
+    @staticmethod
+    @load_site_callback
+    def resolve_use_legacy_update_webhook_emission(_, _info, site):
+        return site.settings.use_legacy_update_webhook_emission

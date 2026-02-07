@@ -11,6 +11,7 @@ from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import transaction
 from django.db.models import Exists, OuterRef, Q, QuerySet
+from django.utils import timezone
 from prices import Money
 
 from ....checkout import models
@@ -18,16 +19,11 @@ from ....checkout.actions import call_checkout_info_event
 from ....checkout.error_codes import CheckoutErrorCode
 from ....checkout.fetch import CheckoutInfo, CheckoutLineInfo
 from ....checkout.utils import (
-    assign_built_in_shipping_to_checkout,
     assign_collection_point_to_checkout,
-    assign_external_shipping_to_checkout,
-    calculate_checkout_quantity,
-    clear_delivery_method,
-    get_external_shipping_id,
+    assign_shipping_method_to_checkout,
     invalidate_checkout,
     is_shipping_required,
     remove_delivery_method_from_checkout,
-    remove_external_shipping_from_checkout,
 )
 from ....core.exceptions import InsufficientStock, PermissionDenied
 from ....discount import DiscountType, DiscountValueType
@@ -41,7 +37,6 @@ from ....discount.utils.promotion import (
 from ....permission.enums import CheckoutPermissions
 from ....product import models as product_models
 from ....product.models import ProductChannelListing, ProductVariant
-from ....shipping import interface as shipping_interface
 from ....warehouse import models as warehouse_models
 from ....warehouse.availability import check_stock_and_preorder_quantity_bulk
 from ....webhook.event_types import WebhookEventAsyncType
@@ -72,68 +67,13 @@ class CheckoutLineData:
     metadata_list: list = field(default_factory=list)
 
 
-def clean_delivery_method(
-    checkout_info: "CheckoutInfo",
-    method: shipping_interface.ShippingMethodData | warehouse_models.Warehouse | None,
-) -> bool:
-    """Check if current shipping method is valid."""
-    if not method:
-        # no shipping method was provided, it is valid
-        return True
-
-    if not checkout_info.shipping_address and isinstance(
-        method, shipping_interface.ShippingMethodData
-    ):
-        raise ValidationError(
-            "Cannot choose a shipping method for a checkout without the "
-            "shipping address.",
-            code=CheckoutErrorCode.SHIPPING_ADDRESS_NOT_SET.value,
-        )
-
-    if isinstance(method, shipping_interface.ShippingMethodData):
-        return method in checkout_info.valid_shipping_methods
-
-    return method in checkout_info.valid_pick_up_points
-
-
-def _is_external_shipping_valid(checkout_info: "CheckoutInfo") -> bool:
-    if external_shipping_id := get_external_shipping_id(checkout_info.checkout):
-        return external_shipping_id in [
-            method.id for method in checkout_info.valid_delivery_methods
-        ]
-    return True
-
-
-def update_checkout_external_shipping_method_if_invalid(
-    checkout_info: "CheckoutInfo", lines: list[CheckoutLineInfo]
-):
-    if not _is_external_shipping_valid(checkout_info):
-        remove_external_shipping_from_checkout(checkout_info.checkout, save=True)
-
-
-def update_checkout_shipping_method_if_invalid(
-    checkout_info: "CheckoutInfo", lines: list[CheckoutLineInfo]
+def mark_checkout_deliveries_as_stale_if_needed(
+    checkout: models.Checkout, lines: list[CheckoutLineInfo]
 ) -> list[str]:
-    """Check if current shipping method is valid and clean it if not.
-
-    The method is not saving the applied changes on checkout.
-    """
-    quantity = calculate_checkout_quantity(lines)
-    update_fields = []
-
-    # remove shipping method when empty checkout
-    if quantity == 0 or not is_shipping_required(lines):
-        update_fields = clear_delivery_method(checkout_info)
-
-    is_valid = clean_delivery_method(
-        checkout_info=checkout_info,
-        method=checkout_info.get_delivery_method_info().delivery_method,
-    )
-
-    if not is_valid:
-        update_fields = clear_delivery_method(checkout_info)
-
-    return update_fields
+    if not is_shipping_required(lines):
+        return []
+    checkout.delivery_methods_stale_at = timezone.now()
+    return ["delivery_methods_stale_at"]
 
 
 def get_variants_and_total_quantities(
@@ -378,6 +318,9 @@ def group_lines_input_on_add(
         variant_id = cast(str, line.get("variant_id"))
         force_new_line = line.get("force_new_line")
         metadata_list_from_input = line.get("metadata", [])
+        # if metadata is None in input, it should be treated as empty list
+        if not metadata_list_from_input:
+            metadata_list_from_input = []
 
         _, variant_db_id = graphene.Node.from_global_id(variant_id)
 
@@ -487,7 +430,10 @@ def check_permissions_for_custom_prices(app, lines):
     if any("price" in line for line in lines) and (
         not app or not app.has_perm(CheckoutPermissions.HANDLE_CHECKOUTS)
     ):
-        raise PermissionDenied(permissions=[CheckoutPermissions.HANDLE_CHECKOUTS])
+        raise PermissionDenied(
+            message="Setting the custom price is allowed only for apps with `MANAGE_CHECKOUTS` permission.",
+            permissions=[CheckoutPermissions.HANDLE_CHECKOUTS],
+        )
 
 
 def find_line_id_when_variant_parameter_used(
@@ -578,9 +524,7 @@ def apply_gift_reward_if_applicable_on_checkout_creation(
         currency=checkout.currency,
     )
     with transaction.atomic():
-        line, _line_created = create_gift_line(
-            checkout, gift_listing, line_discount_data
-        )
+        line = create_gift_line(checkout, gift_listing, line_discount_data)
         CheckoutLineDiscount.objects.create(line=line, **asdict(line_discount_data))
 
 
@@ -614,39 +558,30 @@ def assign_delivery_method_to_checkout(
     checkout_info: CheckoutInfo,
     lines_info: list[CheckoutLineInfo],
     manager: "PluginsManager",
-    delivery_method_data: (
-        shipping_interface.ShippingMethodData | warehouse_models.Warehouse | None
-    ),
+    delivery_method: models.CheckoutDelivery | warehouse_models.Warehouse | None,
 ):
     fields_to_update = []
     checkout = checkout_info.checkout
     with transaction.atomic():
-        if delivery_method_data is None:
+        if delivery_method is None:
             fields_to_update = remove_delivery_method_from_checkout(
                 checkout=checkout_info.checkout
             )
-            checkout_info.shipping_method = None
             checkout_info.collection_point = None
+            checkout_info.assigned_delivery = None
 
-        elif isinstance(delivery_method_data, shipping_interface.ShippingMethodData):
-            if delivery_method_data.is_external:
-                fields_to_update = assign_external_shipping_to_checkout(
-                    checkout, delivery_method_data
-                )
-                checkout_info.shipping_method = None
-                checkout_info.collection_point = None
-            else:
-                fields_to_update = assign_built_in_shipping_to_checkout(
-                    checkout, delivery_method_data
-                )
-                checkout_info.shipping_method = checkout.shipping_method
-                checkout_info.collection_point = None
-        elif isinstance(delivery_method_data, warehouse_models.Warehouse):
+        elif isinstance(delivery_method, models.CheckoutDelivery):
+            fields_to_update = assign_shipping_method_to_checkout(
+                checkout, delivery_method
+            )
+            checkout_info.collection_point = None
+            checkout_info.assigned_delivery = delivery_method
+        elif isinstance(delivery_method, warehouse_models.Warehouse):
             fields_to_update = assign_collection_point_to_checkout(
-                checkout, delivery_method_data
+                checkout, delivery_method
             )
             checkout_info.shipping_address = checkout.shipping_address
-            checkout_info.shipping_method = None
+            checkout_info.assigned_delivery = None
 
         if not fields_to_update:
             return
